@@ -1,39 +1,26 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
 )
 
-var db *sql.DB
-
-func main() {
-	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		panic(err.Error())
-	}
-	defer db.Close()
-
-	r := gin.Default()
-	r.POST("/clientes/:id/transacoes", transacoes)
-	r.GET("/clientes/:id/extrato", extrato)
-	r.Run()
-}
-
 type Transacao struct {
-	Valor       int       `json:"valor":"required"`
-	Tipo        string    `json:"tipo":"required"`
-	Descricao   string    `json:"descricao":"required"`
-	RealizadaEm time.Time `json:"realizada_em":"required"`
+	Valor       int       `json:"valor" binding:"required"`
+	Tipo        string    `json:"tipo" binding:"required"`
+	Descricao   string    `json:"descricao" binding:"required"`
+	RealizadaEm time.Time `json:"realizada_em"`
 }
 
 type Saldo struct {
@@ -43,70 +30,190 @@ type Saldo struct {
 }
 
 type Extrato struct {
-	Saldo Saldo `json:"saldo"`
+	Saldo      Saldo       `json:"saldo"`
+	Transacoes []Transacao `json:"ultimas_transacoes"`
 }
 
 func (t *Transacao) estaValido() bool {
-	return validaDescricao(t.Descricao) && validaTipo(t.Tipo)
+
+	if t.Tipo != "c" && t.Tipo != "d" {
+		return false
+	}
+
+	if len(t.Descricao) == 0 || len(t.Descricao) > 10 {
+		return false
+	}
+
+	if t.Valor < 0 {
+		return false
+	}
+
+	return true
 }
 
-func transacoes(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-	fmt.Println(id)
+var dbpool *pgxpool.Pool
 
-	var t Transacao
-	if c.BindJSON(&t) != nil {
-		c.Status(http.StatusBadRequest)
-		return
+func main() {
+	ctx := context.Background()
+	var err error
+	dbpool, err = pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		dbpool.Close()
+		panic(err.Error())
 	}
-	fmt.Println("descricao", t.Descricao)
+	defer dbpool.Close()
+
+	app := fiber.New()
+	app.Post("/clientes/:id/transacoes", transacoes)
+	app.Get("/clientes/:id/extrato", extrato)
+	app.Listen(":8080")
+}
+
+func transacoes(c *fiber.Ctx) error {
+	ctx := context.Background()
+	clienteId, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return c.SendStatus(http.StatusNotFound)
+	}
+
+	t := &Transacao{}
+	err = json.Unmarshal(c.Body(), &t)
+	if err != nil {
+		return c.SendStatus(http.StatusUnprocessableEntity)
+	}
 
 	if !t.estaValido() {
-		c.Status(http.StatusBadRequest)
-		return
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	jsonParam := json.RawMessage(fmt.Sprintf(`{"limite":"%d","saldo":"%d"}`, 1, 2))
+	fator := 1
+	if t.Tipo == "d" {
+		fator = -1
+	}
 
-	c.PureJSON(http.StatusOK, jsonParam)
+	cmd, err := dbpool.Exec(ctx, `INSERT INTO saldos (cliente_id, limite, balanco) SELECT 
+			id, limite,
+			((
+				SELECT 
+					balanco
+				FROM saldos 
+				WHERE cliente_id = clientes.id
+				ORDER BY criado_em DESC
+				LIMIT 1
+			) + ($2))
+		FROM clientes WHERE id = $1
+	`, clienteId, (fator * t.Valor))
+	if err != nil {
+		return c.SendStatus(http.StatusUnprocessableEntity)
+	}
+	if cmd.RowsAffected() == 0 {
+		return c.SendStatus(http.StatusNotFound)
+	}
+
+	_, err = dbpool.Exec(ctx, "INSERT INTO transacoes(cliente_id,valor,operacao,descricao)values($1,$2,$3,$4)",
+		clienteId, t.Valor, t.Tipo, t.Descricao)
+	if err != nil {
+		return c.SendStatus(http.StatusBadRequest)
+	}
+
+	limite := 0
+	balanco := 0
+	row := dbpool.QueryRow(ctx, `
+			SELECT 
+				limite,
+				(SELECT 
+					balanco
+				FROM saldos 
+				WHERE cliente_id = clientes.id
+				ORDER BY criado_em DESC
+				LIMIT 1) as balanco
+			FROM clientes 
+			WHERE id = $1`,
+		clienteId,
+	)
+	err = row.Scan(&limite, &balanco)
+	if err != nil {
+		return c.SendStatus(http.StatusBadRequest)
+	}
+
+	return c.JSON(
+		json.RawMessage(fmt.Sprintf(`{"limite": %d,"saldo": %d}`, limite, balanco)),
+	)
 }
 
-func extrato(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"message": 1,
-	})
+func extrato(c *fiber.Ctx) error {
+	clienteId, err := strconv.Atoi(c.Params("id"))
+	if err != nil {
+		return c.SendStatus(http.StatusNotFound)
+	}
 
-	// {
-	// 	"saldo": {
-	// 	  "total": -9098,
-	// 	  "data_extrato": "2024-01-17T02:34:41.217753Z",
-	// 	  "limite": 100000
-	// 	},
-	// 	"ultimas_transacoes": [
-	// 	  {
-	// 		"valor": 10,
-	// 		"tipo": "c",
-	// 		"descricao": "descricao",
-	// 		"realizada_em": "2024-01-17T02:34:38.543030Z"
-	// 	  },
-	// 	  {
-	// 		"valor": 90000,
-	// 		"tipo": "d",
-	// 		"descricao": "descricao",
-	// 		"realizada_em": "2024-01-17T02:34:38.543030Z"
-	// 	  }
-	// 	]
-	//   }
-}
+	extrato := Extrato{
+		Transacoes: make([]Transacao, 0),
+	}
 
-func validaTipo(param string) bool {
-	return param == "c" || param == "d"
-}
+	status := http.StatusOK
 
-func validaDescricao(param string) bool {
-	return len(param) >= 1 && len(param) <= 10
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		row := dbpool.QueryRow(context.Background(), `
+				SELECT 
+					limite, 
+					now() as data_extrato,
+					(
+						SELECT 
+							balanco
+						FROM saldos 
+						WHERE cliente_id = clientes.id
+						ORDER BY criado_em DESC
+						LIMIT 1
+					) as balanco
+				FROM clientes 
+				WHERE id = $1`,
+			clienteId,
+		)
+
+		err = row.Scan(&extrato.Saldo.Limite, &extrato.Saldo.DataExtrato, &extrato.Saldo.Total)
+		if err != nil {
+			status = http.StatusNotFound
+		}
+		wg.Done()
+	}()
+
+	wg.Add(1)
+	go func() {
+		rows, err := dbpool.Query(
+			context.Background(),
+			`SELECT valor, operacao, descricao, criado_em 
+			FROM transacoes WHERE cliente_id = $1
+			ORDER BY criado_em DESC LIMIT 10`,
+			clienteId,
+		)
+		if err != nil {
+			log.Println(err.Error())
+			if status != http.StatusNotFound {
+				status = http.StatusBadRequest
+			}
+			wg.Done()
+		}
+
+		for rows.Next() {
+			var tr Transacao
+			if err := rows.Scan(&tr.Valor, &tr.Tipo, &tr.Descricao, &tr.RealizadaEm); err != nil {
+				if status != http.StatusNotFound {
+					status = http.StatusBadRequest
+				}
+			}
+			extrato.Transacoes = append(extrato.Transacoes, tr)
+		}
+		wg.Done()
+	}()
+
+	wg.Wait()
+
+	if status == http.StatusOK {
+		return c.JSON(extrato)
+	} else {
+		return c.SendStatus(status)
+	}
 }
