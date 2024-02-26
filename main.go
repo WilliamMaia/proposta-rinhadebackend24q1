@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
 )
@@ -32,23 +33,6 @@ type Saldo struct {
 type Extrato struct {
 	Saldo      Saldo       `json:"saldo"`
 	Transacoes []Transacao `json:"ultimas_transacoes"`
-}
-
-func (t *Transacao) estaValido() bool {
-
-	if t.Tipo != "c" && t.Tipo != "d" {
-		return false
-	}
-
-	if len(t.Descricao) == 0 || len(t.Descricao) > 10 {
-		return false
-	}
-
-	if t.Valor < 0 {
-		return false
-	}
-
-	return true
 }
 
 var dbpool *pgxpool.Pool
@@ -82,7 +66,9 @@ func transacoes(c *fiber.Ctx) error {
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	if !t.estaValido() {
+	_, err = dbpool.Exec(ctx, "INSERT INTO transacoes(cliente_id,valor,operacao,descricao)values($1,$2,$3,$4)",
+		clienteId, t.Valor, t.Tipo, t.Descricao)
+	if err != nil {
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
@@ -91,7 +77,7 @@ func transacoes(c *fiber.Ctx) error {
 		fator = -1
 	}
 
-	cmd, err := dbpool.Exec(ctx, `INSERT INTO saldos (cliente_id, limite, balanco) SELECT 
+	row := dbpool.QueryRow(ctx, `INSERT INTO saldos (cliente_id, limite, balanco) SELECT 
 			id, limite,
 			((
 				SELECT 
@@ -101,39 +87,18 @@ func transacoes(c *fiber.Ctx) error {
 				ORDER BY criado_em DESC
 				LIMIT 1
 			) + ($2))
-		FROM clientes WHERE id = $1
+		FROM clientes WHERE id = $1 RETURNING limite, balanco
 	`, clienteId, (fator * t.Valor))
-	if err != nil {
-		return c.SendStatus(http.StatusUnprocessableEntity)
-	}
-	if cmd.RowsAffected() == 0 {
-		return c.SendStatus(http.StatusNotFound)
-	}
-
-	_, err = dbpool.Exec(ctx, "INSERT INTO transacoes(cliente_id,valor,operacao,descricao)values($1,$2,$3,$4)",
-		clienteId, t.Valor, t.Tipo, t.Descricao)
-	if err != nil {
-		return c.SendStatus(http.StatusBadRequest)
-	}
 
 	limite := 0
 	balanco := 0
-	row := dbpool.QueryRow(ctx, `
-			SELECT 
-				limite,
-				(SELECT 
-					balanco
-				FROM saldos 
-				WHERE cliente_id = clientes.id
-				ORDER BY criado_em DESC
-				LIMIT 1) as balanco
-			FROM clientes 
-			WHERE id = $1`,
-		clienteId,
-	)
+
 	err = row.Scan(&limite, &balanco)
+	if err == pgx.ErrNoRows {
+		return c.SendStatus(http.StatusNotFound)
+	}
 	if err != nil {
-		return c.SendStatus(http.StatusBadRequest)
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
 	return c.JSON(
